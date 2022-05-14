@@ -60,13 +60,14 @@ static void updateVirtualTable(
 */
 void sqlite3ColumnDefault(Vdbe *v, Table *pTab, int i, int iReg){
   assert( pTab!=0 );
-  if( !pTab->pSelect ){
+  if( !IsView(pTab) ){
     sqlite3_value *pValue = 0;
     u8 enc = ENC(sqlite3VdbeDb(v));
     Column *pCol = &pTab->aCol[i];
-    VdbeComment((v, "%s.%s", pTab->zName, pCol->zName));
+    VdbeComment((v, "%s.%s", pTab->zName, pCol->zCnName));
     assert( i<pTab->nCol );
-    sqlite3ValueFromExpr(sqlite3VdbeDb(v), pCol->pDflt, enc, 
+    sqlite3ValueFromExpr(sqlite3VdbeDb(v), 
+                         sqlite3ColumnExpr(pTab,pCol), enc, 
                          pCol->affinity, &pValue);
     if( pValue ){
       sqlite3VdbeAppendP4(v, pValue, P4_MEM);
@@ -220,6 +221,7 @@ static void updateFromSelect(
 
   assert( pTabList->nSrc>1 );
   if( pSrc ){
+    pSrc->a[0].fg.notCte = 1;
     pSrc->a[0].iCursor = -1;
     pSrc->a[0].pTab->nTabRef--;
     pSrc->a[0].pTab = 0;
@@ -235,7 +237,7 @@ static void updateFromSelect(
       pList = sqlite3ExprListAppend(pParse, pList, pNew);
     }
     eDest = IsVirtual(pTab) ? SRT_Table : SRT_Upfrom;
-  }else if( pTab->pSelect ){
+  }else if( IsView(pTab) ){
     for(i=0; i<pTab->nCol; i++){
       pList = sqlite3ExprListAppend(pParse, pList, exprRowColumn(pParse, i));
     }
@@ -249,7 +251,8 @@ static void updateFromSelect(
     }
 #endif
   }
-  if( ALWAYS(pChanges) ){
+  assert( pChanges!=0 || pParse->db->mallocFailed );
+  if( pChanges ){
     for(i=0; i<pChanges->nExpr; i++){
       pList = sqlite3ExprListAppend(pParse, pList, 
           sqlite3ExprDup(db, pChanges->a[i].pExpr, 0)
@@ -257,8 +260,9 @@ static void updateFromSelect(
     }
   }
   pSelect = sqlite3SelectNew(pParse, pList, 
-      pSrc, pWhere2, pGrp, 0, pOrderBy2, SF_UpdateFrom|SF_IncludeHidden, pLimit2
+      pSrc, pWhere2, pGrp, 0, pOrderBy2, SF_UFSrcCheck|SF_IncludeHidden, pLimit2
   );
+  if( pSelect ) pSelect->selFlags |= SF_OrderByReqd;
   sqlite3SelectDestInit(&dest, eDest, iEph);
   dest.iSDParm2 = (pPk ? pPk->nKeyCol : -1);
   sqlite3Select(pParse, pSelect, &dest);
@@ -358,7 +362,7 @@ void sqlite3Update(
   */
 #ifndef SQLITE_OMIT_TRIGGER
   pTrigger = sqlite3TriggersExist(pParse, pTab, TK_UPDATE, pChanges, &tmask);
-  isView = pTab->pSelect!=0;
+  isView = IsView(pTab);
   assert( pTrigger || tmask==0 );
 #else
 # define pTrigger 0
@@ -447,13 +451,16 @@ void sqlite3Update(
   */
   chngRowid = chngPk = 0;
   for(i=0; i<pChanges->nExpr; i++){
+    u8 hCol = sqlite3StrIHash(pChanges->a[i].zEName);
     /* If this is an UPDATE with a FROM clause, do not resolve expressions
     ** here. The call to sqlite3Select() below will do that. */
     if( nChangeFrom==0 && sqlite3ResolveExprNames(&sNC, pChanges->a[i].pExpr) ){
       goto update_cleanup;
     }
     for(j=0; j<pTab->nCol; j++){
-      if( sqlite3StrICmp(pTab->aCol[j].zName, pChanges->a[i].zEName)==0 ){
+      if( pTab->aCol[j].hName==hCol
+       && sqlite3StrICmp(pTab->aCol[j].zCnName, pChanges->a[i].zEName)==0
+      ){
         if( j==pTab->iPKey ){
           chngRowid = 1;
           pRowidExpr = pChanges->a[i].pExpr;
@@ -467,7 +474,7 @@ void sqlite3Update(
           testcase( pTab->aCol[j].colFlags & COLFLAG_STORED );
           sqlite3ErrorMsg(pParse, 
              "cannot UPDATE generated column \"%s\"",
-             pTab->aCol[j].zName);
+             pTab->aCol[j].zCnName);
           goto update_cleanup;
         }
 #endif
@@ -491,7 +498,7 @@ void sqlite3Update(
     {
       int rc;
       rc = sqlite3AuthCheck(pParse, SQLITE_UPDATE, pTab->zName,
-                            j<0 ? "ROWID" : pTab->aCol[j].zName,
+                            j<0 ? "ROWID" : pTab->aCol[j].zCnName,
                             db->aDb[iDb].zDbSName);
       if( rc==SQLITE_DENY ){
         goto update_cleanup;
@@ -523,8 +530,10 @@ void sqlite3Update(
       for(i=0; i<pTab->nCol; i++){
         if( aXRef[i]>=0 ) continue;
         if( (pTab->aCol[i].colFlags & COLFLAG_GENERATED)==0 ) continue;
-        if( sqlite3ExprReferencesUpdatedColumn(pTab->aCol[i].pDflt,
-                                               aXRef, chngRowid) ){
+        if( sqlite3ExprReferencesUpdatedColumn(
+                sqlite3ColumnExpr(pTab, &pTab->aCol[i]),
+                 aXRef, chngRowid)
+        ){
           aXRef[i] = 99999;
           bProgress = 1;
         }
@@ -643,6 +652,7 @@ void sqlite3Update(
   if( (db->flags&SQLITE_CountRows)!=0
    && !pParse->pTriggerTab
    && !pParse->nested
+   && !pParse->bReturning
    && pUpsert==0
   ){
     regRowCount = ++pParse->nMem;
@@ -798,7 +808,12 @@ void sqlite3Update(
   
     /* Top of the update loop */
     if( eOnePass!=ONEPASS_OFF ){
-      if( !isView && aiCurOnePass[0]!=iDataCur && aiCurOnePass[1]!=iDataCur ){
+      if( aiCurOnePass[0]!=iDataCur
+       && aiCurOnePass[1]!=iDataCur
+#ifdef SQLITE_ALLOW_ROWID_IN_VIEW
+       && !isView
+#endif
+      ){
         assert( pPk );
         sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, labelBreak, regKey,nKey);
         VdbeCoverage(v);
@@ -1106,7 +1121,7 @@ void sqlite3Update(
   ** that information.
   */
   if( regRowCount ){
-    sqlite3VdbeAddOp2(v, OP_ResultRow, regRowCount, 1);
+    sqlite3VdbeAddOp2(v, OP_ChngCntRow, regRowCount, 1);
     sqlite3VdbeSetNumCols(v, 1);
     sqlite3VdbeSetColName(v, 0, COLNAME_NAME, "rows updated", SQLITE_STATIC);
   }

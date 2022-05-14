@@ -135,6 +135,7 @@ void sqlite3Fts5ParseError(Fts5Parse *pParse, const char *zFmt, ...){
   va_list ap;
   va_start(ap, zFmt);
   if( pParse->rc==SQLITE_OK ){
+    assert( pParse->zErr==0 );
     pParse->zErr = sqlite3_vmprintf(zFmt, ap);
     pParse->rc = SQLITE_ERROR;
   }
@@ -433,6 +434,7 @@ static i64 fts5ExprSynonymRowid(Fts5ExprTerm *pTerm, int bDesc, int *pbEof){
   int bRetValid = 0;
   Fts5ExprTerm *p;
 
+  assert( pTerm );
   assert( pTerm->pSynonym );
   assert( bDesc==0 || bDesc==1 );
   for(p=pTerm; p; p=p->pSynonym){
@@ -1500,8 +1502,8 @@ int sqlite3Fts5ExprFirst(Fts5Expr *p, Fts5Index *pIdx, i64 iFirst, int bDesc){
   }
 
   /* If the iterator is not at a real match, skip forward until it is. */
-  while( pRoot->bNomatch ){
-    assert( pRoot->bEof==0 && rc==SQLITE_OK );
+  while( pRoot->bNomatch && rc==SQLITE_OK ){
+    assert( pRoot->bEof==0 );
     rc = fts5ExprNodeNext(p, pRoot, 0, 0);
   }
   return rc;
@@ -1873,7 +1875,7 @@ int sqlite3Fts5ExprClonePhrase(
     sCtx.pPhrase = sqlite3Fts5MallocZero(&rc, sizeof(Fts5ExprPhrase));
   }
 
-  if( rc==SQLITE_OK ){
+  if( rc==SQLITE_OK && ALWAYS(sCtx.pPhrase) ){
     /* All the allocations succeeded. Put the expression object together. */
     pNew->pIndex = pExpr->pIndex;
     pNew->pConfig = pExpr->pConfig;
@@ -2144,9 +2146,8 @@ void sqlite3Fts5ParseSetColset(
 ){
   Fts5Colset *pFree = pColset;
   if( pParse->pConfig->eDetail==FTS5_DETAIL_NONE ){
-    pParse->rc = SQLITE_ERROR;
-    pParse->zErr = sqlite3_mprintf(
-      "fts5: column queries are not supported (detail=none)"
+    sqlite3Fts5ParseError(pParse, 
+        "fts5: column queries are not supported (detail=none)"
     );
   }else{
     fts5ParseSetColset(pParse, pExpr, pColset, &pFree);
@@ -2320,13 +2321,10 @@ Fts5ExprNode *sqlite3Fts5ParseNode(
                 || pPhrase->nTerm>1
                 || (pPhrase->nTerm>0 && pPhrase->aTerm[0].bFirst)
               ){
-              assert( pParse->rc==SQLITE_OK );
-              pParse->rc = SQLITE_ERROR;
-              assert( pParse->zErr==0 );
-              pParse->zErr = sqlite3_mprintf(
+              sqlite3Fts5ParseError(pParse, 
                   "fts5: %s queries are not supported (detail!=full)", 
                   pNear->nPhrase==1 ? "phrase": "NEAR"
-                  );
+              );
               sqlite3_free(pRet);
               pRet = 0;
             }
@@ -2412,6 +2410,7 @@ Fts5ExprNode *sqlite3Fts5ParseImplicitAnd(
   return pRet;
 }
 
+#ifdef SQLITE_TEST
 static char *fts5ExprTermPrint(Fts5ExprTerm *pTerm){
   sqlite3_int64 nByte = 0;
   Fts5ExprTerm *p;
@@ -2778,12 +2777,14 @@ static void fts5ExprFold(
     sqlite3_result_int(pCtx, sqlite3Fts5UnicodeFold(iCode, bRemoveDiacritics));
   }
 }
+#endif /* ifdef SQLITE_TEST */
 
 /*
 ** This is called during initialization to register the fts5_expr() scalar
 ** UDF with the SQLite handle passed as the only argument.
 */
 int sqlite3Fts5ExprInit(Fts5Global *pGlobal, sqlite3 *db){
+#ifdef SQLITE_TEST
   struct Fts5ExprFunc {
     const char *z;
     void (*x)(sqlite3_context*,int,sqlite3_value**);
@@ -2801,6 +2802,10 @@ int sqlite3Fts5ExprInit(Fts5Global *pGlobal, sqlite3 *db){
     struct Fts5ExprFunc *p = &aFunc[i];
     rc = sqlite3_create_function(db, p->z, -1, SQLITE_UTF8, pCtx, p->x, 0, 0);
   }
+#else
+  int rc = SQLITE_OK;
+  UNUSED_PARAM2(pGlobal,db);
+#endif
 
   /* Avoid warnings indicating that sqlite3Fts5ParserTrace() and
   ** sqlite3Fts5ParserFallback() are unused */
@@ -2851,6 +2856,15 @@ struct Fts5PoslistPopulator {
   int bMiss;
 };
 
+/*
+** Clear the position lists associated with all phrases in the expression
+** passed as the first argument. Argument bLive is true if the expression
+** might be pointing to a real entry, otherwise it has just been reset.
+**
+** At present this function is only used for detail=col and detail=none
+** fts5 tables. This implies that all phrases must be at most 1 token
+** in size, as phrase matches are not supported without detail=full.
+*/
 Fts5PoslistPopulator *sqlite3Fts5ExprClearPoslists(Fts5Expr *pExpr, int bLive){
   Fts5PoslistPopulator *pRet;
   pRet = sqlite3_malloc64(sizeof(Fts5PoslistPopulator)*pExpr->nPhrase);
@@ -2860,7 +2874,7 @@ Fts5PoslistPopulator *sqlite3Fts5ExprClearPoslists(Fts5Expr *pExpr, int bLive){
     for(i=0; i<pExpr->nPhrase; i++){
       Fts5Buffer *pBuf = &pExpr->apExprPhrase[i]->poslist;
       Fts5ExprNode *pNode = pExpr->apExprPhrase[i]->pNode;
-      assert( pExpr->apExprPhrase[i]->nTerm==1 );
+      assert( pExpr->apExprPhrase[i]->nTerm<=1 );
       if( bLive && 
           (pBuf->n==0 || pNode->iRowid!=pExpr->pRoot->iRowid || pNode->bEof)
       ){
